@@ -248,7 +248,7 @@ def step4_topic_stats(bugs: pd.DataFrame) -> pd.DataFrame:
     ax.set_xlabel("share of bugs")
     ax.set_title("Theme prevalence (95% Wilson CI)")
     plt.tight_layout()
-    fig.savefig("topic_prevalence.png", dpi=150, bbox_inches="tight")
+    fig.savefig("assets/topic_prevalence.png", dpi=150, bbox_inches="tight")
     print("[topic_stats] saved topic_prevalence.png")
     return df
 
@@ -707,7 +707,7 @@ def step6_kappa(extract_df: pd.DataFrame) -> dict:
     oai = OpenAI()
 
     HUMAN         = "human_labels.csv"
-    GUIDE         = "human_labels_GUIDE.md"
+    GUIDE         = "docs/human_labels_GUIDE.md"
     JUDGE_MODEL   = CHAT_MODEL
     JUDGE_THRESH  = 5
     FEW_SHOT_IDS  = {1963368, 1991810, 2041211, 2048096}
@@ -770,7 +770,7 @@ def step6_kappa(extract_df: pd.DataFrame) -> dict:
         ax.set_xlabel("number of bugs")
         ax.set_title("Supervisor trajectory distribution")
         plt.tight_layout()
-        fig.savefig("agent_trajectories.png", dpi=150, bbox_inches="tight")
+        fig.savefig("assets/agent_trajectories.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
         print("[kappa] saved agent_trajectories.png")
 
