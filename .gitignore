@@ -25,6 +25,8 @@ uv.lock
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+development.ipynb
+notebooks/development.ipynb
 
 # Project-specific
 chroma_db/
