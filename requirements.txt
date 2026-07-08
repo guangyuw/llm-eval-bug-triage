@@ -1,0 +1,21 @@
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+matplotlib>=3.7
+statsmodels>=0.14              # prevalence CIs / trend tests
+openai>=1.0                   # embeddings (text-embedding-3-small) + chat (gpt-4o-mini)
+python-dotenv>=1.0            # load OPENAI_API_KEY from .env
+chromadb>=0.5                 # vector store for embeddings (step 2)
+langgraph>=0.2                # self-correcting extraction agent graph (step 5)
+langchain-openai>=0.3         # ChatOpenAI.bind_tools -> tool-calling agent (step 5)
+mcp>=1.2                      # serve/read semantic metadata via MCP (mcp_server.py)
+ipykernel>=6.29              # run the walkthrough notebook (showcase.ipynb)
+# scikit-learn (above) also powers step3 clustering (KMeans + silhouette) + step7 classifier
+# optional extensions:
+# hdbscan>=0.8                 # density clustering instead of KMeans
+# bertopic>=0.16               # turnkey topic modeling
+# faiss-cpu>=1.8               # vector store (or chromadb)
+# fastapi>=0.110 ; uvicorn      # only if you add the deployment step
+#
+# Data: CFPB complaints.csv (download separately, not a pip package):
+#   https://files.consumerfinance.gov/ccdb/complaints.csv.zip
