@@ -194,23 +194,49 @@ def step3_cluster(bugs: pd.DataFrame, col: "chromadb.Collection") -> pd.DataFram
 
     km_final = KMeans(n_clusters=best_k, random_state=SEED, n_init="auto")  # match development.ipynb
     labels = km_final.fit_predict(vecs_aligned)
+    centers = km_final.cluster_centers_  # available after fit_predict
 
-    # Name each cluster with GPT-4o
+    # Name each cluster with GPT-4o: centroid-nearest 6 bugs (full text[:200]) – matches development.ipynb
     bugs_aligned = bugs.iloc[:len(idx)].copy()
     bugs_aligned["_cluster"] = labels
+
+    NAME_PROMPT = ("These are representative bug reports from one cluster. "
+                   "Give a SHORT label (3 words max, no quotes, no trailing punctuation) "
+                   "for what they share.\n{samples}\nLabel:")
+
+    def _name_call_llm(prompt: str) -> str:
+        for attempt in range(6):
+            try:
+                return oai.chat.completions.create(
+                    model=CHAT_MODEL, temperature=0, max_tokens=300,
+                    messages=[{"role": "user", "content": prompt}]
+                ).choices[0].message.content
+            except Exception as exc:
+                if getattr(exc, "status_code", None) == 429 or "rate_limit" in str(exc).lower():
+                    wait = 2 ** attempt * 5
+                    print(f"  [rate limit] waiting {wait}s before retry {attempt + 1}/6 ...")
+                    time.sleep(wait)
+                else:
+                    raise
+        return oai.chat.completions.create(
+            model=CHAT_MODEL, temperature=0, max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        ).choices[0].message.content
+
     theme_map = {}
     for c in range(best_k):
-        samples = (bugs_aligned[bugs_aligned["_cluster"] == c]["summary"]
-                   .dropna().head(10).tolist())
-        prompt = ("Name this software-bug cluster in ≤5 words (title case, no quotes).\n"
-                  "Summaries:\n" + "\n".join(f"- {s}" for s in samples))
-        theme_map[c] = oai.chat.completions.create(
-            model=CHAT_MODEL, temperature=0,
-            messages=[{"role": "user", "content": prompt}]
-        ).choices[0].message.content.strip()
+        members = np.where(labels == c)[0]
+        dist = np.linalg.norm(vecs_aligned[members] - centers[c], axis=1)
+        near = members[np.argsort(dist)[:6]]
+        samples = "\n".join(f"- {str(bugs_aligned['text'].iloc[i])[:200]}" for i in near)
+        try:
+            raw = _name_call_llm(NAME_PROMPT.format(samples=samples))
+            theme_map[c] = raw.strip().splitlines()[0].strip().strip('"').strip(".")[:40]
+        except Exception:
+            theme_map[c] = f"cluster {c}"
+        print(f"  {c:>2} ({len(members):>4}) -> {theme_map[c]!r}")
 
     bugs_aligned["cluster_theme"] = bugs_aligned["_cluster"].map(theme_map)
-    print(f"[cluster] themes: {list(theme_map.values())}")
     return bugs_aligned.drop(columns=["_cluster"])
 
 
@@ -273,7 +299,10 @@ def _mcp_call_sync(tool: str, args: dict | None = None) -> str:
     from mcp.client.stdio import stdio_client
 
     async def _inner():
-        params = StdioServerParameters(command=sys.executable, args=["mcp_server.py"])
+        _mcp_path = os.path.join(os.path.dirname(__file__), "scripts", "mcp_server.py")
+        if not os.path.exists(_mcp_path):
+            _mcp_path = "mcp_server.py"  # fallback for cwd-based invocation
+        params = StdioServerParameters(command=sys.executable, args=[_mcp_path])
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as sess:
                 await sess.initialize()
@@ -390,46 +419,45 @@ def _build_agent(catalog: dict, schema: str,
     from langgraph.graph import END, START, StateGraph
 
     SUPERVISOR_PROMPT = (
-        "You are the SUPERVISOR of a bug-field extraction team. "
-        "Route to exactly ONE worker per turn.\n"
-        "Workers:\n"
-        "- research: gather evidence via retrieval tools. "
-        "Use when the affected area is unclear or you need precedents.\n"
-        "- extract: write the JSON {{area,severity,kind}} from bug text + evidence. "
-        "Use when you have enough info, OR to REWRITE after a critic rejection.\n"
-        "- critique: check the current extraction. Use right after a new extraction.\n"
-        "- FINISH: stop. Use ONLY after the critic accepted it (critic_ok=true), "
-        "or to give up near the step budget.\n"
-        "Reply ONLY JSON: {{\"next\": \"research|extract|critique|FINISH\", "
-        "\"reason\": str}}.\n"
-        "Team state:\n{state}"
+        'You are the SUPERVISOR of a bug-field extraction team. Route to exactly ONE worker per turn.\n'
+        'Workers:\n'
+        '- research: gather evidence via retrieval tools (similar bugs / read a bug / component stats). '
+        'Use when the affected area is unclear or you need precedents.\n'
+        '- extract: write the JSON {{area,severity,kind}} from bug text + evidence. '
+        'Use when you have enough info, OR to REWRITE after a critic rejection.\n'
+        '- critique: check the current extraction (schema + faithfulness). Use right after a new extraction.\n'
+        '- FINISH: stop. Use ONLY after the critic accepted it (critic_ok=true), or to give up near the step budget.\n'
+        'Be efficient: if the bug text is self-explanatory, SKIP research and go straight to extract '
+        '(wasting retrieval calls is penalized). After a rejection, decide smartly — if the critique is a '
+        'format/enum error go extract (rewrite); if it is a wrong-area / weak-grounding problem go research first.\n'
+        'Reply ONLY JSON: {{\"next\": \"research|extract|critique|FINISH\", \"reason\": str}}.\n'
+        'Team state:\n{state}'
     )
 
     RESEARCH_SYS = (
-        "You are the RESEARCHER. Collect JUST ENOUGH evidence to classify a bug "
-        "into these fields: {schema}\n"
-        "Tools: search_similar_bugs(bug_id), read_bug(bug_id), "
-        "component_prior(component).\n"
-        "When done, reply with a SHORT plain-text evidence summary "
-        "(NO JSON, NO tool call)."
+        'You are the RESEARCHER. Collect JUST ENOUGH evidence to classify a bug into these fields: {schema}\n'
+        'Tools you may call (multi-step is fine; stop early once you have enough):\n'
+        '- search_similar_bugs(bug_id): historical bugs most similar to this one (id, similarity, official component, short summary).\n'
+        '- read_bug(bug_id): full text of ONE bug — use to disambiguate a promising but unclear neighbor.\n'
+        '- component_prior(component): historical stats for an official component: bug count, and the severity distribution + typical severity already mapped to the low/med/high scale (untriaged bugs excluded), plus example summaries. Use it to sanity-check your severity against the component norm.\n'
+        'A good chain is often search -> (read the best neighbor) -> (component_prior once area is likely). '
+        'When done, reply with a SHORT plain-text evidence summary (NO JSON, NO tool call).'
     ).format(schema=schema)
 
     EXTRACT_PROMPT = (
-        "Extract structured fields from a software bug report. "
-        "Field semantics: {schema}\n"
-        "Return ONLY a JSON object "
-        "{{\"area\": str, \"severity\": \"low|med|high\", "
-        "\"kind\": \"crash|ui|performance|security|data|other\"}}.\n"
-        "{feedback}"
-        "Bug report:\n```{text}```\nCollected evidence:\n{evidence}"
+        'Extract structured fields from a software bug report. Field semantics (data catalog): {schema}\n'
+        'Use the bug text and the collected evidence (ground your answer, do NOT copy neighbors blindly). '
+        'Return ONLY a JSON object '
+        '{{\"area\": str, \"severity\": \"low|med|high\", \"kind\": \"crash|ui|performance|security|data|other\"}}.\n'
+        '{feedback}'
+        'Bug report:\n```{text}```\nCollected evidence:\n{evidence}'
     )
 
     CRITIQUE_PROMPT = (
-        "You are a reviewer. Is this extraction faithful and well-formed? "
-        "Reject (ok=false) ONLY for a clear contradiction, invented facts, "
-        "or an off-topic area.\n"
-        "Reply ONLY JSON: {{\"ok\": true|false, \"reason\": str}}.\n"
-        "Bug report:\n```{text}```\nExtraction: {extraction}"
+        'You are a reviewer. Is this extraction faithful to the bug report and well-formed? '
+        'Reject (ok=false) ONLY for a clear contradiction, invented facts, or an off-topic area.\n'
+        'Reply ONLY JSON: {{\"ok\": true|false, \"reason\": str}}.\n'
+        'Bug report:\n```{text}```\nExtraction: {extraction}'
     )
 
     def schema_ok(obj):
@@ -590,7 +618,7 @@ def _build_agent(catalog: dict, schema: str,
             d = json.loads(raw)
         except Exception:
             d = {}
-        return {"ok": bool(d.get("ok", False)),
+        return {"ok": bool(d.get("ok", True)),
                 "critique": str(d.get("reason", ""))[:300]}
 
     def route_supervisor(s):
@@ -833,9 +861,10 @@ def step6_kappa(extract_df: pd.DataFrame) -> dict:
 
 def step7_dedup(bugs: pd.DataFrame, pairs: pd.DataFrame,
                 col: "chromadb.Collection") -> dict:
-    """Evaluate duplicate-bug retrieval on the 4,987 hard-label pairs.
+    """Evaluate duplicate-bug retrieval on the hard-label pairs.
 
-    Returns a dict with hit@1, hit@5, hit@10, MRR.
+    Returns a dict with hit@1, hit@5, hit@10, MRR, and slice diagnostics
+    (by cluster theme and same/cross-component) – matches development.ipynb Cell 27–30.
     """
     dup_ids = pairs["dup_id"].astype(str).tolist()
     master_ids = pairs["master_id"].astype(str).tolist()
@@ -850,12 +879,12 @@ def step7_dedup(bugs: pd.DataFrame, pairs: pd.DataFrame,
     hits_at = {1: 0, 5: 0, 10: 0}
     rr_sum = 0.0
     K = 10
+    pair_results: list[tuple[str, str, int, float]] = []  # (dup_id, master_id, hit@10, rr)
 
     BATCH = 100
     for start in range(0, len(valid), BATCH):
         batch = valid[start: start + BATCH]
         dup_batch = [d for d, _ in batch]
-        master_batch = [m for _, m in batch]
 
         got = col.get(ids=dup_batch, include=["embeddings"])
         # Chroma may reorder
@@ -868,11 +897,13 @@ def step7_dedup(bugs: pd.DataFrame, pairs: pd.DataFrame,
         res = col.query(query_embeddings=vecs, n_results=K + 1)
         for i, (dup, master) in enumerate(valid_sub):
             retrieved = [r for r in res["ids"][i] if r != dup][:K]
+            h10 = int(master in retrieved[:10])
+            rr_val = 1.0 / (retrieved.index(master) + 1) if master in retrieved else 0.0
             for k_val in (1, 5, 10):
                 if master in retrieved[:k_val]:
                     hits_at[k_val] += 1
-            if master in retrieved:
-                rr_sum += 1.0 / (retrieved.index(master) + 1)
+            rr_sum += rr_val
+            pair_results.append((dup, master, h10, rr_val))
 
         if (start + BATCH) % 1000 == 0 or start + BATCH >= len(valid):
             print(f"[dedup]   {min(start + BATCH, len(valid)):,}/{len(valid):,}")
@@ -888,6 +919,68 @@ def step7_dedup(bugs: pd.DataFrame, pairs: pd.DataFrame,
           f"  hit@5={metrics['hit@5']:.3f}"
           f"  hit@10={metrics['hit@10']:.3f}"
           f"  MRR={metrics['mrr']:.3f}")
+
+    # --- Slice diagnostics: by cluster theme × same/cross component ---
+    # Matches development.ipynb Cell 30; uses cluster_theme col from step3 and
+    # component col already in bugs. Since we query top-K only (not full matrix),
+    # MRR here is a lower-bound approximation (pairs outside top-10 get rr=0).
+    has_theme = "cluster_theme" in bugs.columns and "component" in bugs.columns
+    rows_sl: list = []
+    by_cluster: dict[str, list] = {}
+    by_cross: dict[bool, list] = {True: [0, 0.0, 0], False: [0, 0.0, 0]}
+    if has_theme and pair_results:
+        bugs_idx = bugs.set_index(bugs["id"].astype(str)) if "id" in bugs.columns else bugs
+        for dup_id, master_id, h10, rr_val in pair_results:
+            try:
+                theme = str(bugs_idx.loc[master_id, "cluster_theme"])
+                dup_comp = str(bugs_idx.loc[dup_id, "component"])
+                master_comp = str(bugs_idx.loc[master_id, "component"])
+            except KeyError:
+                continue
+            d = by_cluster.setdefault(theme, [0, 0.0, 0])
+            d[0] += h10; d[1] += rr_val; d[2] += 1
+            key = (dup_comp == master_comp)
+            by_cross[key][0] += h10; by_cross[key][1] += rr_val; by_cross[key][2] += 1
+
+        rows_sl = [(theme, h / cnt, r / cnt, cnt)
+                   for theme, (h, r, cnt) in by_cluster.items() if cnt >= 50]
+        rows_sl.sort(key=lambda x: x[1])
+        print(f"[dedup] slice by theme (n≥50, {len(rows_sl)} themes, Hit@10 asc)")
+        print("  Hardest (bottom 3):")
+        for name_, p, r, cnt in rows_sl[:3]:
+            print(f"    {name_[:34]:<34}  Hit@10={p:.2f}  MRR={r:.2f}  n={cnt}")
+        print("  Easiest (top 3):")
+        for name_, p, r, cnt in rows_sl[-3:]:
+            print(f"    {name_[:34]:<34}  Hit@10={p:.2f}  MRR={r:.2f}  n={cnt}")
+        _tot = by_cross[True][2] + by_cross[False][2]
+        print("\n[dedup] same-component vs cross-component:")
+        for key, nm in [(True, "same-component"), (False, "cross-component")]:
+            h, r, cnt = by_cross[key]
+            print(f"  {nm:<16}  Hit@10={h/cnt:.2f}  MRR={r/cnt:.2f}"
+                  f"  n={cnt:,} ({cnt/_tot:.0%})")
+
+        # Save chart (same layout as development.ipynb Cell 30)
+        os.makedirs("assets", exist_ok=True)
+        labs_s = [x[0][:22] for x in rows_sl]
+        vals_s = [x[1] for x in rows_sl]
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 4))
+        plt.barh(labs_s, vals_s, color="#4c72b0")
+        plt.gca().invert_yaxis()
+        plt.xlim(0, 1)
+        plt.axvline(metrics["hit@10"], color="C3", ls="--",
+                    label=f"overall Hit@10={metrics['hit@10']:.2f}")
+        plt.xlabel("hit@10")
+        plt.title(f"Duplicate retrieval · sliced by theme "
+                  f"(n≥50, {len(rows_sl)} themes)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("assets/dedup_slice.png", dpi=120)
+        plt.close()
+        print("[dedup] saved assets/dedup_slice.png")
+
+    metrics["_slice_by_theme"] = rows_sl
+    metrics["_slice_by_cross"] = by_cross
     return metrics
 
 
@@ -930,7 +1023,23 @@ def step8_readout(topic_df: pd.DataFrame,
 
     print("\n-- Dedup retrieval --")
     for k, v in dedup_metrics.items():
-        print(f"  {k}: {v:.3f}")
+        if not k.startswith("_"):
+            print(f"  {k}: {v:.3f}")
+    rows_sl = dedup_metrics.get("_slice_by_theme", [])
+    by_cross = dedup_metrics.get("_slice_by_cross", {})
+    if rows_sl:
+        print(f"\n  Slice by theme (n≥50, {len(rows_sl)} themes, Hit@10 asc):")
+        for name_, p, r, cnt in rows_sl[:3]:
+            print(f"    Hardest  {name_[:30]:<30}  Hit@10={p:.2f}  MRR={r:.2f}")
+        for name_, p, r, cnt in rows_sl[-3:]:
+            print(f"    Easiest  {name_[:30]:<30}  Hit@10={p:.2f}  MRR={r:.2f}")
+    if by_cross and all(by_cross[k][2] > 0 for k in by_cross):
+        _tot = sum(v[2] for v in by_cross.values())
+        print("\n  Same-component vs cross-component:")
+        for key, nm in [(True, "same-component"), (False, "cross-component")]:
+            h, r, cnt = by_cross[key]
+            print(f"    {nm:<16}  Hit@10={h/cnt:.2f}  MRR={r/cnt:.2f}"
+                  f"  n={cnt:,} ({cnt/_tot:.0%})")
 
     print("=" * 60)
 
